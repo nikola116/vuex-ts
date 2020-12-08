@@ -1,0 +1,173 @@
+version: 2.1
+
+references:
+  docker_hub_authentication: &docker_hub_authentication
+    auth:
+      username: $DOCKERHUB_USER
+      password: $DOCKERHUB_PASSWORD
+
+parameters:
+  run_api_trigger_jobs:
+    type: boolean
+    default: false
+
+commands:
+  yarn_install:
+    steps:
+      - restore_cache:
+          keys:
+            - nuxt-node-modules-v3-{{ checksum "yarn.lock" }}
+      - run:
+          command: |
+            [ "`which yarn`" != "" ] && yarn --unsafe-perm || true
+  save_node_module_cache:
+    steps:
+      - save_cache:
+          key: nuxt-node-modules-v3-{{ checksum "yarn.lock" }}
+          paths: node_modules
+  setup_git_lfs:
+    steps:
+      - restore_cache:
+          keys:
+            - git-lfs--v2.8.0
+      - run:
+          name: setup git lfs
+          command: |
+            if [ ! -e ~/bin/git-lfs ]; then
+              curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | sudo bash
+              sudo apt-get install -y git-lfs
+              cp -a /usr/bin/git-lfs ~/bin
+            fi
+            git lfs install
+            git lfs pull
+      - save_cache:
+          key: git-lfs--v2.8.0
+          paths: ~/bin/git-lfs
+
+jobs:
+  lint:
+    working_directory: /home/circleci/project
+    docker:
+      - image: node:12.20-alpine
+        <<: *docker_hub_authentication
+    steps:
+      - run: ':' # declared noop command because in order to use the conditional step need one or more tasks or the when statement
+      - unless:
+          condition: << pipeline.parameters.run_api_trigger_jobs >>
+          steps:
+            - checkout
+            - run:
+                name: install depend packages
+                command: apk add --no-cache --update ca-certificates git
+            - yarn_install
+            - run:
+                command: yarn lint .
+
+  test:
+    machine: true
+    steps:
+      - run: ':'
+      - unless:
+          condition: << pipeline.parameters.run_api_trigger_jobs >>
+          steps:
+            - checkout
+            - setup_git_lfs
+            - run:
+                name: fetch visual testing expect files
+                command: |
+                  git checkout nuxt
+                  git reset --hard origin/nuxt
+                  git lfs pull
+                  git pull origin nuxt
+                  cp -a __tests__ __temp
+                  find __temp -type f | grep -v -e '__image_snapshots__' | xargs rm -f
+                  git checkout $CIRCLE_BRANCH
+                  cp -a __temp/* __tests__/
+                  rm -rf __temp
+            - yarn_install
+            - run:
+                name: jest
+                command: |
+                  TEST_ARGS="-i --ci --coverage --reporters=jest-junit"
+                  [ "$CIRCLE_BRANCH" = "nuxt" ] && TEST_ARGS="$TEST_ARGS -u"
+
+                  cat \<<EOF > .env
+                  LOCAL_UID=$(id -u $USER)
+                  LOCAL_GID=$(id -g $USER)
+                  TEST_ARGS=$TEST_ARGS
+                  JEST_JUNIT_OUTPUT_DIR=reports/jest/
+                  JEST_JUNIT_OUTPUT_NAME=results.xml
+                  E2E_USER_EMAIL=$E2E_USER_EMAIL
+                  E2E_USER_PASSWORD=$E2E_USER_PASSWORD
+                  CODECOV_TOKEN=$CODECOV_TOKEN
+                  RAILS_HOSTS=backend
+                  EOF
+
+                  docker login -u $DOCKERHUB_USER -p $DOCKERHUB_PASSWORD
+                  docker-compose -f docker-compose.yml -f docker-compose.circleci.yml run --rm puppeteer
+            - run:
+                command: rm -rf storybook-static # not store artifact on fail test
+                when: on_fail
+            - save_node_module_cache
+            - store_test_results:
+                path: reports
+            - store_artifacts:
+                path: __tests__/storyshots/__image_snapshots__/__diff_output__
+                destination: /fail_images
+#            - store_artifacts:
+#                path: storybook-static
+#                destination: /storybook
+            - persist_to_workspace:
+                root: .
+                paths:
+                  - __tests__
+
+  push_snapshot:
+    machine: true
+    steps:
+      - checkout
+      - setup_git_lfs
+      - attach_workspace:
+          at: .
+      - run:
+          name: publish
+          command: |
+            git add __tests__
+
+            if [ `git diff --cached --name-only | wc -l` -eq 0 ]; then
+              echo 'skip: no update snapshot'
+              exit 0
+            fi
+
+            git config user.email "mazda13bturbo@gmail.com"
+            git config user.name "Yama-Tomo"
+            git commit -m "[ci skip] chore: update snapshot files" -m "" -m "relate: $CIRCLE_SHA1"
+            git push origin nuxt
+
+  #something:
+  #  docker:
+  #    - image: node:12.19-alpine
+  #  steps:
+  #    - run: ':'
+  #    - when:
+  #        condition: << pipeline.parameters.run_api_trigger_jobs >>
+  #        steps:
+  #          - run: echo "run something"
+
+workflows:
+  build:
+    jobs:
+      - lint
+      - test
+      - push_snapshot:
+          requires:
+            - test
+          filters:
+            branches:
+              only:
+                - nuxt
+  ## how to trigger bellow workflow
+  # curl -u ${TOKEN}: --header 'Content-Type: application/json' -X POST -d '{"parameters": {"run_api_trigger_jobs": true}, "branch": "'${BRANCH}'"}' https://circleci.com/api/v2/project/gh/Yama-Tomo/vue-vuex-typescript-sample/pipeline
+  #trigger_api:
+  #  jobs:
+  #    - something
